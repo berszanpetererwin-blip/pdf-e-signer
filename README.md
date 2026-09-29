@@ -1,5 +1,8 @@
 # Semnătură Digitală PDF Pro
 
+Fork al proiectului pdf-e-signer de ionutanton (CC BY-NC 4.0), adaptat pentru tokenul IDEMIA IDPlug / CEI și chei ECC. Modificări: vezi CHANGELOG.md.
+
+
 O aplicație desktop modernă și intuitivă pentru semnarea electronică în bloc (batch) a documentelor PDF folosind token-uri hardware (HSM/USB cu PKCS#11).
 Aplicația permite încărcarea și previzualizarea documentelor, definirea chenarului de semnătură pe o pagină specifică prin drag-and-drop și aplicarea unei semnături electronice calificate pentru mai multe documente simultan.
 
