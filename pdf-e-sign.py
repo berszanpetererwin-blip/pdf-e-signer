@@ -11,11 +11,19 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple
 from PIL import Image, ImageTk
-import fitz  # PyMuPDF
+try:
+    import pymupdf as fitz  # PyMuPDF (API nou)
+except ImportError:
+    import fitz  # PyMuPDF (versiuni vechi)
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import PyKCS11
 from endesive.pdf import cms
+from endesive import signer as _endesive_signer
+from asn1crypto import cms as _asn1_cms, algos as _asn1_algos
+from cryptography.hazmat.primitives.asymmetric import ec as _ec, rsa as _rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+import hashlib
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 
@@ -43,13 +51,14 @@ SETTINGS_FILE = "signature_settings.json"
 DEFAULT_SETTINGS = {
     "contact": "",
     "location": "România",
-    "reason": "Aprobat",
+    "reason": "",
     "bg_color": "#ffffff",
+    "transparent_bg": False,
     "outline_color": "#000000",
-    "border": 1,
+    "border": 0.5,
     "display_cn": True,
     "display_date": True,
-    "display_reason": True,
+    "display_reason": False,
     "display_location": False,
     "display_contact": False,
     "fontsize": 8,
@@ -66,7 +75,11 @@ DEFAULT_SETTINGS = {
 
 # --- PROFILURI DRIVERE PKCS#11 ---
 if IS_WINDOWS:
+    _PF = os.environ.get("ProgramFiles", r"C:\Program Files")
+    _PF86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
     DLL_PRESETS = {
+        "IDEMIA / IDPlug (idplug-pkcs11.dll)": os.path.join(_PF, "IDEMIA", "IDPlugClassic", "DLLs", "idplug-pkcs11.dll"),
+        "IDEMIA / IDPlug x86 (idplug-pkcs11.dll)": os.path.join(_PF86, "IDEMIA", "IDPlugClassic", "DLLs", "idplug-pkcs11.dll"),
         "Alfasign / SafeNet (eToken.dll)": r"C:\Windows\System32\eToken.dll",
         "DigiSign / SafeNet (eToken.dll)": r"C:\Windows\System32\eToken.dll",
         "DigiSign / ePass2003 (eps2003csp11.dll)": r"C:\Windows\System32\eps2003csp11.dll",
@@ -96,90 +109,266 @@ def hex_to_rgb(hex_str):
     if len(hex_str) != 6: return [0.0, 0.0, 0.0]
     return [int(hex_str[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
 
+_orig_endesive_sign = _endesive_signer.sign
+
+def _patched_endesive_sign(*args, **kwargs):
+    """endesive marchează mereu semnătura ca RSA când se folosește un HSM.
+    Pentru chei EC corectăm algoritmul în CMS (semnătura rămâne validă, deoarece
+    algoritmul nu face parte din atributele semnate)."""
+    out = _orig_endesive_sign(*args, **kwargs)
+    hsm = kwargs.get('hsm', args[7] if len(args) > 7 else None)
+    if hsm is not None and getattr(hsm, 'key_type', 'rsa') == 'ec':
+        hashalgo = kwargs.get('hashalgo', args[4] if len(args) > 4 else 'sha256')
+        ci = _asn1_cms.ContentInfo.load(out)
+        si = ci['content']['signer_infos'][0]
+        si['signature_algorithm'] = _asn1_algos.SignedDigestAlgorithm({'algorithm': f'{hashalgo}_ecdsa'})
+        out = ci.dump(force=True)
+    return out
+
+_endesive_signer.sign = _patched_endesive_sign
+
+
 class HardwareTokenHSM:
-    """Gestionarea Hardware-ului (PKCS#11) cu suport Universal Multi-Token"""
-    
+    """Gestionarea Hardware-ului (PKCS#11) cu suport Universal Multi-Token.
+
+    IMPORTANT (fix IDPlug / IDEMIA): ID-urile de slot NU sunt stabile la unele
+    drivere PKCS#11 (IDPlug, unele SafeNet). Se pot schimba la fiecare
+    C_Initialize / reîncărcare a DLL-ului sau la reintroducerea token-ului.
+    De aceea:
+      * DLL-ul se încarcă o singură dată per proces (cache), nu la fiecare acțiune;
+      * token-ul se identifică prin serialNumber + label, iar slotul se
+        RE-REZOLVĂ chiar înainte de semnare;
+      * certificatul se identifică prin conținutul lui (DER), nu doar prin CKA_ID
+        (care poate fi gol sau duplicat).
+    """
+
+    _LIBS = {}
+
+    @classmethod
+    def _get_lib(cls, dll_path, force_reload=False):
+        key = os.path.normcase(os.path.abspath(dll_path))
+        if force_reload and key in cls._LIBS:
+            old = cls._LIBS.pop(key)
+            try:
+                old.lib.C_Finalize()
+            except Exception:
+                pass
+            del old
+        lib = cls._LIBS.get(key)
+        if lib is None:
+            if not os.path.exists(dll_path):
+                raise FileNotFoundError(f"Fișierul driver nu a fost găsit la: {dll_path}")
+            lib = PyKCS11.PyKCS11Lib()
+            try:
+                lib.load(dll_path)
+            except Exception as e:
+                raise Exception(f"Eroare la încărcarea driver-ului: {e}")
+            cls._LIBS[key] = lib
+        return lib
+
+    @staticmethod
+    def _tok_ident(pkcs11, slot):
+        ti = pkcs11.getTokenInfo(slot)
+        label = str(ti.label).strip()
+        serial = str(ti.serialNumber).strip()
+        return label, serial
+
     @staticmethod
     def list_all_certificates(dll_path):
-        if not os.path.exists(dll_path):
-            raise FileNotFoundError(f"Fișierul driver nu a fost găsit la: {dll_path}")
+        pkcs11 = HardwareTokenHSM._get_lib(dll_path)
 
-        pkcs11 = PyKCS11.PyKCS11Lib()
-        try:
-            pkcs11.load(dll_path)
-        except Exception as e:
-            raise Exception(f"Eroare la încărcarea driver-ului: {e}")
-        
         slots = pkcs11.getSlotList(tokenPresent=True)
         if not slots:
+            # poate driverul a rămas cu o stare veche -> o încercare cu reload
+            pkcs11 = HardwareTokenHSM._get_lib(dll_path, force_reload=True)
+            slots = pkcs11.getSlotList(tokenPresent=True)
+        if not slots:
             raise Exception("Nu s-a detectat niciun token USB conectat valid pentru acest driver!")
-        
+
         certs_info = []
         for slot in slots:
+            session = None
             try:
-                token_info = pkcs11.getTokenInfo(slot)
-                label = token_info.label.strip() if isinstance(token_info.label, str) else str(token_info.label)
-                
+                label, serial = HardwareTokenHSM._tok_ident(pkcs11, slot)
+                logging.info(f"Slot {slot}: token label='{label}', serial='{serial}'")
+
                 session = pkcs11.openSession(slot, PyKCS11.CKF_SERIAL_SESSION)
                 certs = session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
-                
+
                 for cert in certs:
                     cka_id = session.getAttributeValue(cert, [PyKCS11.CKA_ID])[0]
                     cert_val = session.getAttributeValue(cert, [PyKCS11.CKA_VALUE])[0]
                     cert_bytes = bytes(cert_val)
-                    
+
                     try:
                         cert_obj = x509.load_der_x509_certificate(cert_bytes, default_backend())
                         cn = cert_obj.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-                    except:
+                    except Exception:
                         cn = "Certificat Necunoscut"
 
                     certs_info.append({
                         'slot': slot,
                         'token_label': label,
+                        'token_serial': serial,
                         'cka_id': tuple(cka_id),
                         'cn': cn,
                         'cert_der': cert_bytes
                     })
-                session.closeSession()
             except Exception as e:
                 logging.warning(f"Eroare citire slot {slot}: {e}")
-                
+            finally:
+                if session is not None:
+                    try:
+                        session.closeSession()
+                    except Exception:
+                        pass
+
         return certs_info
 
-    def __init__(self, dll_path, pin, target_slot, target_cka_id):
-        logging.info(f"--- INIȚIALIZARE HSM PE SLOTUL {target_slot} ---")
-        
-        self.pkcs11 = PyKCS11.PyKCS11Lib()
-        self.pkcs11.load(dll_path)
-            
-        self.session = self.pkcs11.openSession(target_slot, PyKCS11.CKF_SERIAL_SESSION | PyKCS11.CKF_RW_SESSION)
+    @staticmethod
+    def _resolve_slot(pkcs11, target_slot, token_serial, token_label):
+        """Găsește slotul ACTUAL al token-ului (ID-ul se poate schimba)."""
+        slots = pkcs11.getSlotList(tokenPresent=True)
+        logging.info(f"Sloturi disponibile acum: {list(slots)} (slot memorat: {target_slot})")
+        found = []
+        for s in slots:
+            try:
+                label, serial = HardwareTokenHSM._tok_ident(pkcs11, s)
+            except Exception as e:
+                logging.warning(f"Nu pot citi token-ul din slotul {s}: {e}")
+                continue
+            found.append((s, label, serial))
+            if token_serial and serial == token_serial and (not token_label or label == token_label):
+                return s
+        # fallback: doar serial
+        for s, label, serial in found:
+            if token_serial and serial == token_serial:
+                return s
+        # fallback: slotul memorat, dacă mai există
+        if target_slot in slots:
+            return target_slot
+        # fallback: label
+        for s, label, serial in found:
+            if token_label and label == token_label:
+                return s
+        if len(slots) == 1:
+            return slots[0]
+        raise Exception(
+            "Token-ul selectat nu mai este găsit (slot invalid). Sloturi văzute: "
+            f"{found}. Apasă din nou pe CITEȘTE CERTIFICATE."
+        )
+
+    def _open_session(self, slot):
+        # unele drivere (IDPlug) acceptă mai bine RW, altele doar RO -> încercăm ambele
+        try:
+            return self.pkcs11.openSession(slot, PyKCS11.CKF_SERIAL_SESSION | PyKCS11.CKF_RW_SESSION)
+        except PyKCS11.PyKCS11Error as e:
+            logging.warning(f"openSession RW a eșuat ({e}); încerc sesiune read-only")
+            return self.pkcs11.openSession(slot, PyKCS11.CKF_SERIAL_SESSION)
+
+    def __init__(self, dll_path, pin, target_slot, target_cka_id, token_serial="", token_label="", cert_der=None):
+        logging.info(f"--- INIȚIALIZARE HSM (slot memorat {target_slot}, serial '{token_serial}') ---")
+
+        self.session = None
+        self.pkcs11 = HardwareTokenHSM._get_lib(dll_path)
+
+        try:
+            slot = HardwareTokenHSM._resolve_slot(self.pkcs11, target_slot, token_serial, token_label)
+        except Exception:
+            # ultimă șansă: reîncărcăm driverul și reîncercăm
+            logging.warning("Rezolvare slot eșuată, reîncarc driverul PKCS#11...")
+            self.pkcs11 = HardwareTokenHSM._get_lib(dll_path, force_reload=True)
+            slot = HardwareTokenHSM._resolve_slot(self.pkcs11, target_slot, token_serial, token_label)
+        logging.info(f"Slot folosit pentru semnare: {slot}")
+
+        try:
+            self.session = self._open_session(slot)
+        except PyKCS11.PyKCS11Error as e:
+            if "SLOT_ID_INVALID" in str(e).upper() or "SLOT" in str(e).upper():
+                logging.warning(f"Slot invalid ({e}); reîncarc driverul și reiau.")
+                self.pkcs11 = HardwareTokenHSM._get_lib(dll_path, force_reload=True)
+                slot = HardwareTokenHSM._resolve_slot(self.pkcs11, slot, token_serial, token_label)
+                self.session = self._open_session(slot)
+            else:
+                raise
+
         try:
             self.session.login(pin)
             logging.info("Autentificare hardware reușită pe token-ul țintă!")
         except PyKCS11.PyKCS11Error as e:
-            raise Exception(f"Autentificare eșuată! PIN greșit pentru token-ul ales? Detalii: {e}")
+            if "ALREADY_LOGGED_IN" in str(e).upper():
+                logging.info("Utilizatorul era deja autentificat pe token.")
+            else:
+                self.logout()
+                raise Exception(f"Autentificare eșuată! PIN greșit pentru token-ul ales? Detalii: {e}")
 
-        priv_keys = self.session.findObjects([
-            (PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY), 
-            (PyKCS11.CKA_ID, list(target_cka_id))
-        ])
-        if not priv_keys:
+        # --- găsire certificat (după DER dacă îl avem, altfel după CKA_ID) ---
+        cert_obj_handle = None
+        all_certs = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE)])
+        for c in all_certs:
+            try:
+                val = bytes(self.session.getAttributeValue(c, [PyKCS11.CKA_VALUE])[0])
+            except Exception:
+                continue
+            if cert_der is not None and val == cert_der:
+                cert_obj_handle, self.cert_der = c, val
+                break
+        if cert_obj_handle is None and target_cka_id:
+            for c in all_certs:
+                cid = tuple(self.session.getAttributeValue(c, [PyKCS11.CKA_ID])[0])
+                if cid == tuple(target_cka_id):
+                    cert_obj_handle = c
+                    self.cert_der = bytes(self.session.getAttributeValue(c, [PyKCS11.CKA_VALUE])[0])
+                    break
+        if cert_obj_handle is None:
             self.logout()
-            raise Exception("Cheia privată nu a putut fi găsită. Posibil ca PIN-ul să fie pentru alt certificat.")
-        
-        self.priv_key = priv_keys[0]
+            raise Exception("Certificatul fizic nu a putut fi extras de pe token.")
 
-        certs = self.session.findObjects([
-            (PyKCS11.CKA_CLASS, PyKCS11.CKO_CERTIFICATE), 
-            (PyKCS11.CKA_ID, list(target_cka_id))
-        ])
-        
-        if certs:
-            self.cert_der = bytes(self.session.getAttributeValue(certs[0], [PyKCS11.CKA_VALUE])[0])
-        else:
+        # --- găsire cheie privată (potrivită ca TIP cu certificatul: RSA sau EC) ---
+        self.priv_key = None
+        self.key_type = 'rsa'
+        cert_pub = x509.load_der_x509_certificate(self.cert_der, default_backend()).public_key()
+        want_ec = isinstance(cert_pub, _ec.EllipticCurvePublicKey)
+        want_ck = PyKCS11.CKK_EC if want_ec else PyKCS11.CKK_RSA
+        logging.info(f"Tip cheie publică în certificat: {'EC (ECDSA)' if want_ec else 'RSA'}")
+
+        def _ktype(k):
+            try:
+                return self.session.getAttributeValue(k, [PyKCS11.CKA_KEY_TYPE])[0]
+            except Exception:
+                return None
+
+        all_keys = self.session.findObjects([(PyKCS11.CKA_CLASS, PyKCS11.CKO_PRIVATE_KEY)])
+        logging.info("Chei private pe token: " + str([
+            (tuple(self.session.getAttributeValue(k, [PyKCS11.CKA_ID])[0])[:4], _ktype(k)) for k in all_keys]))
+
+        real_id = tuple(self.session.getAttributeValue(cert_obj_handle, [PyKCS11.CKA_ID])[0])
+        cands = [k for k in all_keys if _ktype(k) == want_ck]
+        # 1) același CKA_ID + același tip
+        for k in cands:
+            if real_id and tuple(self.session.getAttributeValue(k, [PyKCS11.CKA_ID])[0]) == real_id:
+                self.priv_key = k
+                break
+        # 2) RSA: potrivire după modul
+        if self.priv_key is None and not want_ec:
+            n = cert_pub.public_numbers().n
+            for k in cands:
+                m = self.session.getAttributeValue(k, [PyKCS11.CKA_MODULUS])[0]
+                if m and int.from_bytes(bytes(m), 'big') == n:
+                    self.priv_key = k
+                    break
+        # 3) o singură cheie de tipul potrivit
+        if self.priv_key is None and len(cands) == 1:
+            self.priv_key = cands[0]
+
+        if self.priv_key is None:
             self.logout()
-            raise Exception("Certificatul fizic nu a putut fi extras.")
+            raise Exception("Cheia privată (de tipul certificatului) nu a putut fi găsită. "
+                            "Posibil ca PIN-ul să fie pentru alt certificat.")
+
+        self.key_type = 'ec' if want_ec else 'rsa'
+        self.ec_size = ((cert_pub.curve.key_size + 7) // 8) if want_ec else 0
+        logging.info(f"Cheie privată găsită, tip: {self.key_type}")
 
     def certificate(self):
         return self.cert_der, self.cert_der
@@ -190,14 +379,26 @@ class HardwareTokenHSM:
                 keyid, data, algo = args
             else:
                 data, algo = args[0], args[1]
-                
+
             logging.debug(f"Hardware token sign called. Algo={algo}, Data length={len(data)} bytes")
 
-            if algo == 'sha256':
-                mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
-            else:
+            if algo != 'sha256':
                 raise Exception(f"Algoritm nesuportat: {algo}")
-                
+
+            if self.key_type == 'ec':
+                raw = None
+                try:
+                    raw = bytes(self.session.sign(self.priv_key, data,
+                                                  PyKCS11.Mechanism(PyKCS11.CKM_ECDSA_SHA256, None)))
+                except PyKCS11.PyKCS11Error as e:
+                    logging.warning(f"CKM_ECDSA_SHA256 indisponibil ({e}); semnez digest-ul cu CKM_ECDSA")
+                    digest = hashlib.sha256(bytes(data)).digest()
+                    raw = bytes(self.session.sign(self.priv_key, digest,
+                                                  PyKCS11.Mechanism(PyKCS11.CKM_ECDSA, None)))
+                h = len(raw) // 2
+                return encode_dss_signature(int.from_bytes(raw[:h], 'big'), int.from_bytes(raw[h:], 'big'))
+
+            mech = PyKCS11.Mechanism(PyKCS11.CKM_SHA256_RSA_PKCS, None)
             sig = self.session.sign(self.priv_key, data, mech)
             return bytes(sig)
         except Exception as e:
@@ -205,10 +406,17 @@ class HardwareTokenHSM:
             raise e
 
     def logout(self):
+        if self.session is None:
+            return
         try:
             self.session.logout()
+        except Exception:
+            pass
+        try:
             self.session.closeSession()
-        except: pass
+        except Exception:
+            pass
+        self.session = None
 
 
 @dataclass
@@ -349,6 +557,8 @@ class PDFSignerApp(TkinterDnD.Tk):
         self.cert_mapping = {}
         
         self.settings = self._load_settings()
+        self.dll_combo_var.set(self._initial_dll())
+        self.dll_combo_var.trace_add("write", self._on_dll_changed)
         
         self._current_photoimg = None
         self._page_pdf_size = (595, 842)
@@ -372,12 +582,29 @@ class PDFSignerApp(TkinterDnD.Tk):
 
     def _save_settings(self, new_settings):
         logging.info(f"Salvare setări semnătură în fișier: {new_settings}")
-        self.settings = new_settings
+        self.settings = {**self.settings, **new_settings}
         try:
             with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.settings, f, indent=4)
         except Exception as e:
             logging.error(f"Eroare la salvarea JSON: {e}")
+
+    def _initial_dll(self):
+        """Alege driverul la pornire: ultimul folosit, altfel primul preset care există pe PC."""
+        last = self.settings.get("last_dll", "")
+        if last and os.path.exists(DLL_PRESETS.get(last, last)):
+            return last
+        for name, path in DLL_PRESETS.items():
+            if os.path.exists(path):
+                logging.info(f"Driver detectat automat: {name} -> {path}")
+                return name
+        return DEFAULT_DLL
+
+    def _on_dll_changed(self, *args):
+        """Reține driverul ales (preset sau cale manuală) pentru următoarea pornire."""
+        val = self.dll_combo_var.get()
+        if val and self.settings.get("last_dll") != val:
+            self._save_settings({"last_dll": val})
 
     def _get_active_dll_path(self):
         """Preia calea DLL-ului fie din dicționarul de presetări, fie pe cea introdusă manual."""
@@ -539,9 +766,16 @@ class PDFSignerApp(TkinterDnD.Tk):
             return
 
         for c in certs:
-            hex_id = bytes(c['cka_id']).hex()[:6].upper()
+            hex_id = bytes(c['cka_id']).hex()[:6].upper() or "noid"
             display_name = f"{c['cn']} ({c['token_label']}) [{hex_id}]"
-            self.cert_mapping[display_name] = {'slot': c['slot'], 'cka_id': c['cka_id']}
+            n = 2
+            while display_name in self.cert_mapping:
+                display_name = f"{c['cn']} ({c['token_label']}) [{hex_id}] #{n}"
+                n += 1
+            self.cert_mapping[display_name] = {'slot': c['slot'], 'cka_id': c['cka_id'],
+                                                'token_serial': c.get('token_serial', ''),
+                                                'token_label': c.get('token_label', ''),
+                                                'cert_der': c.get('cert_der')}
 
         for name in self.cert_mapping.keys():
             menu.add_command(label=name, command=lambda v=name: self.cert_combo_var.set(v))
@@ -561,9 +795,10 @@ class PDFSignerApp(TkinterDnD.Tk):
         v_contact = tk.StringVar(value=self.settings.get("contact", ""))
         v_location = tk.StringVar(value=self.settings.get("location", ""))
         v_reason = tk.StringVar(value=self.settings.get("reason", ""))
-        v_border = tk.IntVar(value=self.settings.get("border", 1))
+        v_border = tk.DoubleVar(value=float(self.settings.get("border", 0.5)))
         v_bg = tk.StringVar(value=self.settings.get("bg_color", "#ffffff"))
         v_out = tk.StringVar(value=self.settings.get("outline_color", "#000000"))
+        v_transp = tk.BooleanVar(value=self.settings.get("transparent_bg", False))
         
         v_d_cn = tk.BooleanVar(value=self.settings.get("display_cn", True))
         v_d_date = tk.BooleanVar(value=self.settings.get("display_date", True))
@@ -592,11 +827,17 @@ class PDFSignerApp(TkinterDnD.Tk):
                 var.set(color[1])
             update_preview()
 
+        def _safe_border():
+            try:
+                return max(0.0, float(v_border.get()))
+            except Exception:
+                return 0.5
+
         def save():
             logging.info("Buton apăsat: save (Salvează setări)")
             new_s = {
                 "contact": v_contact.get(), "location": v_location.get(), "reason": v_reason.get(),
-                "border": v_border.get(), "bg_color": v_bg.get(), "outline_color": v_out.get(),
+                "border": _safe_border(), "bg_color": v_bg.get(), "outline_color": v_out.get(), "transparent_bg": v_transp.get(),
                 "display_cn": v_d_cn.get(), "display_date": v_d_date.get(), 
                 "display_reason": v_d_reason.get(), "display_location": v_d_loc.get(), "display_contact": v_d_cont.get(),
                 "fontsize": v_fontsize.get(), "textalign": v_textalign.get(), "linespacing": v_linespacing.get(),
@@ -634,9 +875,11 @@ class PDFSignerApp(TkinterDnD.Tk):
         notebook.add(t2, text="Aspect Vizual")
         tk.Label(t2, text="Culori și Contur:", font=("Segoe UI", 10, "bold"), bg="#1a1a2e", fg="#e94560").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,5))
         tk.Label(t2, text="Grosime chenar:", bg="#1a1a2e", fg="#eaeaea").grid(row=1, column=0, sticky="w")
-        tk.Spinbox(t2, from_=0, to=5, textvariable=v_border, width=10).grid(row=1, column=1, sticky="w", pady=2)
+        tk.Spinbox(t2, from_=0, to=5, increment=0.25, format="%.2f", textvariable=v_border, width=10).grid(row=1, column=1, sticky="w", pady=2)
         tk.Button(t2, text="🎨 Fundal", command=lambda: choose_color(v_bg), bg="#0f3460", fg="white", bd=0, width=15).grid(row=2, column=0, pady=5, sticky="w")
         tk.Button(t2, text="🎨 Text/Contur", command=lambda: choose_color(v_out), bg="#0f3460", fg="white", bd=0, width=15).grid(row=2, column=1, pady=5, sticky="w")
+
+        tk.Checkbutton(t2, text="Fundal transparent (fără culoare)", variable=v_transp, bg="#1a1a2e", fg="#4ade80", selectcolor="#0f3460").grid(row=6, column=0, columnspan=2, sticky="w", pady=(5,0))
 
         tk.Label(t2, text="Formatare Text:", font=("Segoe UI", 10, "bold"), bg="#1a1a2e", fg="#e94560").grid(row=3, column=0, columnspan=2, sticky="w", pady=(15,5))
         tk.Label(t2, text="Mărime Text (Font):", bg="#1a1a2e", fg="#eaeaea").grid(row=4, column=0, sticky="w")
@@ -688,13 +931,13 @@ class PDFSignerApp(TkinterDnD.Tk):
             cvs_preview.delete("all")
             bg_c = v_bg.get()
             out_c = v_out.get()
-            bw = v_border.get()
+            bw = _safe_border()
             f_size = v_fontsize.get()
             
             pad_out = 15
             box_w = 320
             box_h = 170
-            cvs_preview.create_rectangle(pad_out, pad_out, pad_out + box_w, pad_out + box_h, fill=bg_c, outline=out_c, width=bw)
+            cvs_preview.create_rectangle(pad_out, pad_out, pad_out + box_w, pad_out + box_h, fill=("" if v_transp.get() else bg_c), outline=out_c, width=bw)
             
             img_offset_x = 0
             if v_use_img.get() and os.path.exists(v_img_path.get()):
@@ -735,7 +978,7 @@ class PDFSignerApp(TkinterDnD.Tk):
             safe_size = min(max(f_size, 6), 24)
             cvs_preview.create_text(x_pos, pad_out + 10, anchor=anchor_p, text=text_str, fill=out_c, font=("Arial", safe_size), justify=v_textalign.get())
 
-        for var in (v_reason, v_location, v_contact, v_border, v_bg, v_out, v_d_cn, v_d_date, v_d_reason, v_d_loc, v_d_cont, v_fontsize, v_textalign, v_lbl_cn, v_lbl_date, v_lbl_reason, v_lbl_loc, v_lbl_contact, v_use_img, v_img_path):
+        for var in (v_reason, v_location, v_contact, v_border, v_bg, v_out, v_transp, v_d_cn, v_d_date, v_d_reason, v_d_loc, v_d_cont, v_fontsize, v_textalign, v_lbl_cn, v_lbl_date, v_lbl_reason, v_lbl_loc, v_lbl_contact, v_use_img, v_img_path):
             var.trace_add("write", update_preview)
             
         update_preview()
@@ -780,7 +1023,8 @@ class PDFSignerApp(TkinterDnD.Tk):
         text_rect = text_rect_v * derot
 
         # 3. Desenăm folosind parametrul rotate pentru a compensa rotația viewer-ului
-        temp_page.draw_rect(border_rect, color=border_color, fill=bg_color, width=self.settings["border"])
+        fill_c = None if self.settings.get("transparent_bg", False) else bg_color
+        temp_page.draw_rect(border_rect, color=border_color, fill=fill_c, width=float(self.settings["border"]))
         
         if img_rect:
             try:
@@ -817,7 +1061,19 @@ class PDFSignerApp(TkinterDnD.Tk):
         
         text_str = "\n".join(lines)
         
-        temp_page.insert_textbox(text_rect, text_str, fontsize=fs, color=border_color, align=align, rotate=rotation)
+        # insert_textbox NU scrie nimic (și nu dă eroare) dacă textul nu încape în chenar -> micșorăm fontul până încape
+        fs_try = float(fs)
+        while True:
+            rc = temp_page.insert_textbox(text_rect, text_str, fontsize=fs_try, color=border_color, align=align, rotate=rotation)
+            if rc >= 0:
+                if fs_try < fs:
+                    logging.warning(f"Chenarul e prea mic pentru fontul {fs}; text scris cu fontul {fs_try}.")
+                break
+            fs_try -= 0.5
+            if fs_try < 3:
+                logging.error(f"Textul nu încape în chenar ({box_v.width:.0f}x{box_v.height:.0f}) nici cu font 3. "
+                              "Desenează un chenar mai mare sau ascunde câmpuri.")
+                break
 
         # Salvăm modificările vizuale în memorie
         datau = temp_doc.tobytes()
@@ -844,6 +1100,8 @@ class PDFSignerApp(TkinterDnD.Tk):
             "signature_manual": []
         }
 
+        if getattr(hsm, 'key_type', 'rsa') == 'ec':
+            dct['aligned'] = 8192  # ECDSA are lungime variabilă -> placeholder fix
         logging.debug(f"Signing dictionary (dct) parameters: {dct}")
         datas = cms.sign(datau, dct, None, cert_obj, (), 'sha256', hsm=hsm)
         logging.debug(f"Signature generated for {input_path}")
@@ -852,12 +1110,12 @@ class PDFSignerApp(TkinterDnD.Tk):
             f.write(datau)
             f.write(datas)
 
-    def _run_batch(self, pin, dll_path, target_slot, target_cka_id):
+    def _run_batch(self, pin, dll_path, target_slot, target_cka_id, token_serial='', token_label='', cert_der=None):
         logging.debug(f"Running batch sign. Total tasks: {len(self.tasks)}, DLL: {dll_path}, Slot: {target_slot}, CKA_ID: {target_cka_id}")
         total = len(self.tasks)
         hsm = None
         try:
-            hsm = HardwareTokenHSM(dll_path, pin, target_slot, target_cka_id)
+            hsm = HardwareTokenHSM(dll_path, pin, target_slot, target_cka_id, token_serial, token_label, cert_der)
             
             errors = []
             for i, t in enumerate(self.tasks):
@@ -878,6 +1136,7 @@ class PDFSignerApp(TkinterDnD.Tk):
                 self.after(0, lambda: messagebox.showinfo("Gata", "Toate documentele au fost semnate cu succes!"))
             
         except Exception as e:
+            logging.error(f"Eroare hardware la inițializare/semnare: {e}", exc_info=True)
             self.after(0, lambda err=str(e): messagebox.showerror("Eroare Hardware", err))
         finally:
             if hsm: 
@@ -902,10 +1161,13 @@ class PDFSignerApp(TkinterDnD.Tk):
 
         target_cka_id = self.cert_mapping[selected_cert_name]['cka_id']
         target_slot = self.cert_mapping[selected_cert_name]['slot']
+        token_serial = self.cert_mapping[selected_cert_name].get('token_serial', '')
+        token_label = self.cert_mapping[selected_cert_name].get('token_label', '')
+        cert_der = self.cert_mapping[selected_cert_name].get('cert_der')
         dll_path = self._get_active_dll_path()
             
         self.btn_sign.config(state="disabled")
-        threading.Thread(target=self._run_batch, args=(pin, dll_path, target_slot, target_cka_id), daemon=True).start()
+        threading.Thread(target=self._run_batch, args=(pin, dll_path, target_slot, target_cka_id, token_serial, token_label, cert_der), daemon=True).start()
 
     def _update_page_controls(self):
         self.page_entry_var.set(str(self.current_page + 1))
